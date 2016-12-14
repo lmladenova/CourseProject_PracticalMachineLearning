@@ -1,0 +1,276 @@
+---
+title: "Predicting the Manner of Barbell Lift Executions"
+author: "Lilyana T. Mladenova"
+date: "December 14, 2016"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(cache=TRUE, message = FALSE, warnings = FALSE)
+```
+
+## I. Executive Summary
+
+The purpose of this project is to predict the manner in which 6 participants executed barbell lifts (i.e, correctly, or incorrectly in 4 different ways). *Extreme Gradient Boosting* and *Random Forest* algorithms were compared. The former algorithm deemed significantly more accurate and was further tuned. The most "optimal" model achieved a 100% accuracy on the trTesting data. 
+
+## II. Loading Dependacies
+
+```{r, echo = TRUE, message = FALSE}
+library(knitr)
+library(caret)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(corrplot)
+library(parallel)
+library(doParallel)
+```
+
+## III. Loading and Pre-Processing Data
+
+### III.1. Loading Data
+
+```{r, echo = TRUE}
+#setwd(./data)
+if(!file.exists("data")){
+        dir.create("data")
+}
+
+train.fileURL <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test.fileURL <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(train.fileURL, destfile = "./data/pml-training.csv")
+download.file(test.fileURL, destfile = "./data/pml-testing.csv")
+tr <- read.csv("./data/pml-training.csv")
+tes <- read.csv("./data/pml-testing.csv")
+```
+
+### III.2. Cleaning Data
+
+* The features, which name consists an element of a descriptive statistic (e.g., skewness, kurtosis) will be removed from the data sets. These features appeared to have predominantly missing values.
+* The first 7 features will also be removed as they deemed to be not informative for the purpose of this analysis. 
+
+```{r, echo = TRUE}
+nr <- grep("^kurtosis|skewness|min|max|avg|stddev|var|amplitude", names(tr))
+training <- tr[, -c(1:7, nr)]
+testing <- tes[, -c(1:7, nr)]
+rm("tes", "tr") #declatering the workspace
+dim(training)
+```
+
+After cleaning the data, 52 features and the dependent variable "classe" remained.
+
+### III.3.Splitting the training data into trTraining and trTesting data
+
+We will split the training data into **trTraining** (75%) and **trTesting** (35%) data sets, which we are going to use to build and tune the predictive model. The cases of the original testing data set (n = 20) will be predicted using the most "optimal" model. 
+
+```{r, echo = TRUE}
+set.seed(1234)
+inTrain <- createDataPartition(y=training$classe, p = 0.75, list = FALSE)
+trTraining <- training[inTrain, ]
+trTesting <- training[-inTrain, ]
+rm("training")
+```
+
+## IV. Exploratory Data Analysis
+
+None of the features has missing values, nor near-zero variance.
+```{r, echo = TRUE}
+sum(sapply(trTraining, function(x) sum(is.na(x)))) # checking for missing values
+```
+
+```{r, echo = TRUE}
+sum(nearZeroVar(trTraining)) # checking for near-zero variance variables
+```
+
+Table 1 presents the results from the descriptive analysis of the data (i.e., mean, variance, skewness, kurtosis).
+
+```{r, echo = TRUE}
+ea.df <- tbl_df(trTraining[, -53]) %>% 
+        mutate(index = 1:14718) %>%
+        melt(id.vars = trTraining$index) %>%
+        filter(variable %in% names(trTraining[, -53])) %>% 
+        group_by(variable) %>% 
+        dplyr:::summarize(mean = round(mean(value), 4), 
+                variance = round(var(value), 4), 
+                skewness = round(skewness(value), 4), 
+                kurtosis = round(kurtosis(value), 4)) %>%
+        as.data.frame
+
+kable(ea.df, caption = "Table 1. Descriptive Statistics")
+```
+
+To comprehend better the results for the distribution of the data, Figure 1 visually presents the level of skewness of the features. It appears that the data points of 14 features are moderately skewed and 12 are highly skewed.
+
+```{r, echo = TRUE}
+skewness <- matrix(apply(trTraining[, -53], 2, skewness))
+ea.df <- data.frame(cbind(names(trTraining[, -53]), skewness))
+colnames(ea.df) <- c("feature", "skew.val")
+ea.df$skew.val <- as.numeric(as.character(ea.df$skew.val))
+ea.df$skew.cat[ea.df$skew.val < -1 | ea.df$skew.val > 1] <- "Highly"
+ea.df$skew.cat[ea.df$skew.val >= -1 & ea.df$skew.val <= -0.5 | ea.df$skew.val >= 0.5 & ea.df$skew.val <= 1] <- "Moderately"
+ea.df$skew.cat[ea.df$skew.val > -0.5 & ea.df$skew.val < 0.5] <- "Normaly"
+ea.df$skew.cat <- factor(ea.df$skew.cat, levels = c("Normaly", "Moderately", "Highly"))
+ggplot(ea.df, aes(x = skew.cat, y = feature, fill = skew.val)) +
+        geom_tile(show.legend = TRUE) +
+        theme_classic() + 
+        theme(axis.text.x = element_text(hjust = 0.5)) +
+        scale_fill_gradient(low = "light blue", high = "blue") + 
+        geom_text(label = round(ea.df$skew.val,3), size = 3, vjust = 0.4) + 
+        labs(title = "Fig.1. Feature Skewness", x = "Skewness Categories", y = "Features")
+``` 
+
+Figure 2 visually presents the results from the correlation analysis of the features. It appears that there is substantial number of high between-predictor correlations.
+
+```{r, echo = TRUE}
+correlations <- cor(trTraining[, -53])
+corrplot(correlations, type = "lower", 
+         title = "Fig.2. Correlation Matrix", 
+         diag = FALSE, 
+         order = "hclust", 
+         hclust.method = "complete", 
+         tl.pos = "ld", 
+         tl.cex = 0.6, 
+         tl.col = "black", 
+         cl.pos = "b",
+         tl.srt=1,
+         mar = c(1, 1, 1, 1))
+```
+
+## V. Rationale
+
+Given the multidimensionality of the data and the peculiarity of the predictors (i.e., moderately to highly skewed predictors and high between-predictor correlations), **Random Forest** and **Extreme Gradient Boosting** will be considered for building the predictive model. In general, ensemble learning methods are very accurate and effective in handling (1) multidimensional data, (2) large number of training examples, and (3) differing types of data (e.g., skewed data) without pre-processing. All of the features will be used in the modeling, as both algorithms have build-in feature selections when accessed with the **train** function of **caret**. 
+
+## VI. Using Cross Validation for Model Selection
+
+10-fold cross validation repeated 3 times will be used to compare the models.
+```{r, echo = TRUE}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+metric <- "Accuracy"
+control <- trainControl(method = "repeatedcv", 
+                        repeats = 3, 
+                        returnData = FALSE,
+                        allowParallel = TRUE)
+set.seed(123)
+mod.rf <- train(classe ~., data = trTraining, 
+                method= "rf", 
+                metric = metric, 
+                trControl = control)
+
+set.seed(123)
+mod.xgb <- train(classe ~., data = trTraining, 
+                 method = "xgbTree", 
+                 metric = metric, 
+                 trControl = control)
+stopCluster(cluster)
+```
+
+Figure 3 visually presents the results from the model comparison. It appears that *Extreme Gradient Boosting* algorithm produces more accurate model with an accuracy of 99.43% and **estimated out-of-sample error** of 0.57%. 
+
+```{r, echo = TRUE}
+results <- resamples(list(RF = mod.rf, XGB = mod.xgb))
+summary(results)
+dotplot(results, main = "Fig.3. RF vs. XGB Comparison")
+```
+
+The hypothesis testing for the difference between the model performances reveals that the difference in the accuracy of 0.001585 is statistically significant, p < 0.001
+
+```{r, echo = TRUE}
+modelDiff <- diff(results)
+summary(modelDiff)
+```
+
+To follow are the tuning parameters of the "optimal model" (among the default values), they will be used as reference values for subsequent tuning the model.
+
+```{r, echo = TRUE}
+mod.xgb$bestTune
+```
+
+The results revealed that the accuracy of the "optimal model" when predicting the **trTesting** data is 99.61% and *error rate of 0.39%*.
+
+```{r, echo = TRUE}
+cm_xgb <-confusionMatrix(predict(mod.xgb, trTesting[, -53]), trTesting$classe)
+cm_xgb
+```
+
+```{r, echo = TRUE}
+error <- (1 - cm_xgb$overall[[1]])*100
+error
+```
+
+## VII. Using Cross Validation for Tuning the Model
+
+10-fold cross validation repeated once will be used to tune the xgb-model. A grid of tree values for each of the tuning parameters: **nrounds**, **max_depth**, **eta** and **gamma** will be created while holding *colsample_bytree*, *min_child_weight*, and *subsample* constant at their respective values from the initial training of the model. 
+
+```{r, echo = TRUE}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+metric <- "Accuracy"
+control_tune <- trainControl(method = "repeatedcv", 
+                        repeats = 1, 
+                        returnData = FALSE,
+                        allowParallel = TRUE)
+
+xgb_tuning <- expand.grid(nrounds = c(100, 150, 200),
+                        max_depth = c(3, 4, 5),
+                        eta = c(0.01, 0.1, 0.4),
+                        gamma = c(0, 1, 2),
+                        colsample_bytree = 0.8,
+                        min_child_weight = 1,
+                        subsample = 0.5
+                        
+                        )
+
+set.seed(123)
+mod.xgb_tuned <- train(classe ~., data = trTraining, 
+                 method = "xgbTree", 
+                 metric = metric, 
+                 trControl = control_tune,
+                 tuneGrid = xgb_tuning)
+stopCluster(cluster)
+```
+
+```{r, echo = TRUE}
+mod.xgb_tuned$bestTune
+```
+
+```{r, echo = TRUE}
+plot(mod.xgb_tuned, main = "Fig.4. Accuracy Comparison across Model Tuning Parameters")
+```
+
+The tuned xgb-model achieved a 100% accuracy on the **trTesting** data.
+
+```{r, echo = TRUE}
+cm_xgb_tuned <- confusionMatrix(predict(mod.xgb_tuned, trTraining[, -53]), trTraining$classe)
+cm_xgb_tuned
+```
+
+```{r, echo = TRUE}
+error.tuned <- (1 - cm_xgb_tuned$overall[[1]])*100
+error.tuned
+```
+
+## VIII. Predicting the Testing Data
+
+To follow are the predictions of the 20 cases of the original **testing** data.
+
+```{r, echo = TRUE}
+predict(mod.xgb_tuned, testing[, -53])
+
+```
+
+
+## IX. Conclusions
+
+*Extreme Gradient Boosting* algorithm produced the more accurate model for predicting the manner of barbell lift executions, when compared to *Random Forest*. While the most "optimal" model achieved a perfect prediction accuracy on the trTesting set, future work on this project could focus on further optimization of the model, such as feature creation beyond the raw readings of the accelerometers.
+
+References:
+
+[1] https://topepo.github.io/caret/feature-selection-overview.html  
+[2] Kuhn, M. & Johnson, K.(2013). Applied Predictive Modeling  
+[3] https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
